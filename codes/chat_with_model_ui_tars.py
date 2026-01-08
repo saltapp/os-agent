@@ -13,9 +13,8 @@ import keyboard  # 用于检测键盘按键
 # 导入配置加载函数
 from utils import load_config
 
-# 通过 pip install volcengine-python-sdk[ark] 安装方舟SDK
-from volcenginesdkarkruntime._exceptions import ArkAPIError
-from volcenginesdkarkruntime import Ark
+# 通过 pip install openai 安装OpenAI SDK
+from openai import OpenAI
 
 
 def parse_action_output(output_text):
@@ -387,53 +386,56 @@ def image_to_base64(image_path):
 def run(img_path, user_prompt, history_text=""):
     """
     运行模型分析图像
-    
+
     参数:
         img_path: 图像路径
         user_prompt: 用户指令
         history_text: 历史操作记录，默认为空
-        
+
     返回:
         模型的响应内容
     """
-    # 创建一个全局ARK客户端实例，避免重复创建
-    global _ark_client
-    
+    # 创建一个全局OpenAI客户端实例，避免重复创建
+    global _openai_client
+
     # 从配置文件加载API信息
     try:
         config = load_config()
         api_key = config["api"]["key"]
-        base_url = config["api"]["base_url"]
+        base_url = config["api"]["base_url"] if config["api"]["base_url"] != "your_base_url_here" else None
         model_id = config["api"]["model_id"]
     except Exception as e:
         print(f"加载配置文件失败: {e}")
         print("请确保 codes/config.json 文件存在并正确配置")
         return f"错误: 配置加载失败 - {e}"
-    
+
     # 从Markdown文件加载系统提示词
     try:
         with open("codes/system_prompt.md", "r", encoding="utf-8") as f:
             sp = f.read()
     except Exception as e:
         print(f"读取系统提示词文件时出错: {e}")
-    
+
     # 添加历史记录
     prompt = f"{sp}\n{user_prompt}"
     if history_text:
         # 构建完整提示
         prompt = f"{sp}\n\n## Action History\n{history_text}\n\n## User Instruction\n{user_prompt}"
-    
+
     try:
         # 如果全局客户端不存在，创建新客户端
-        if '_ark_client' not in globals() or _ark_client is None:
-            _ark_client = Ark(api_key=api_key, base_url=base_url)
-            print("已创建新的ARK客户端")
-        
+        if '_openai_client' not in globals() or _openai_client is None:
+            if base_url:
+                _openai_client = OpenAI(api_key=api_key, base_url=base_url)
+            else:
+                _openai_client = OpenAI(api_key=api_key)
+            print("已创建新的OpenAI客户端")
+
         # 准备图像数据
         image_data = image_to_base64(img_path)
-        
+
         # 调用API
-        response = _ark_client.chat.completions.create(
+        response = _openai_client.chat.completions.create(
             model=model_id,  # 使用配置文件中的模型ID
             temperature=0,  # 控制随机性，0表示最确定的输出
             messages=[
@@ -458,19 +460,14 @@ def run(img_path, user_prompt, history_text=""):
                 }
             ],
         )
-        
+
         # 输出和返回结果
         print("【结果】\n", response.choices[0].message.content)
         return response.choices[0].message.content
-    except ArkAPIError as e:
+    except Exception as e:
         print(f"API错误: {e}")
         # 重置客户端以便下次重新创建
-        globals()['_ark_client'] = None
-        return f"错误: {e}"  # 返回错误信息字符串，而不是None
-    except Exception as e:
-        print(f"发生错误: {e}")
-        # 重置客户端以便下次重新创建
-        globals()['_ark_client'] = None
+        globals()['_openai_client'] = None
         return f"错误: {e}"  # 返回错误信息字符串，而不是None
 
 
@@ -906,7 +903,7 @@ def execute_action(parsed_output, img_size, speed_factor=0.3, screenshot_dir=Non
 def auto_execute_task(user_prompt, max_steps=20, screenshot_dir="data/auto_screenshots", debug=True, save_history=True, show_screenshots=False, wait_time=1):
     """
     自动执行多步骤任务
-    
+
     参数:
         user_prompt: 用户的复杂指令
         max_steps: 最大执行步骤数，防止无限循环
@@ -915,61 +912,65 @@ def auto_execute_task(user_prompt, max_steps=20, screenshot_dir="data/auto_scree
         save_history: 是否保存历史记录到文件
         show_screenshots: 是否显示带边界框的截图弹窗
         wait_time: 操作之间的等待时间(秒)，可调整以平衡速度和稳定性
-        
+
     返回:
         执行结果描述
     """
-    
+
     # 定义ESC键按下时的回调函数
     is_interrupted = [False]  # 使用列表作为可变对象
-    
+
     def on_esc_press(e):
         if e.name == 'esc':
             print("\n" + "="*50)
             print("检测到ESC键，准备中断流程...")
             print("="*50 + "\n")
             is_interrupted[0] = True
-    
+
     # 注册ESC键回调
     keyboard.on_press(on_esc_press)
-    
+
     # 创建截图目录
     os.makedirs(screenshot_dir, exist_ok=True)
-    
+
     # 初始化历史记录
     history_text = ""
     step_count = 0
     history_file = None
-    
+
+    # 用于检测重复操作和判断任务完成
+    recent_actions = []
+    no_progress_count = 0  # 连续无进展的步数
+
     # 创建历史记录文件
     if save_history:
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         history_file_path = f"{screenshot_dir}/history_{timestamp}.txt"
         history_file = open(history_file_path, "w", encoding="utf-8")
         history_file.write(f"任务: {user_prompt}\n\n")
-    
+
     try:
         # 执行循环直到任务完成或达到最大步骤数
         while step_count < max_steps:
             step_count += 1
             print(f"\n===== 执行步骤 {step_count} =====")
-            
+
             # 获取屏幕截图
             screenshot = pyautogui.screenshot()
             screenshot_path = f"{screenshot_dir}/step_{step_count}.png"
             screenshot.save(screenshot_path)
-            
+
             try:
                 # 运行模型获取操作指令
                 model_response = run(screenshot_path, user_prompt, history_text)
-                
+
                 # 检查是否有错误响应
                 if model_response.startswith("错误:"):
                     error_msg = f"模型调用失败: {model_response}"
                     print(error_msg)
                     if save_history and history_file:
                         history_file.write(f"步骤 {step_count} 失败: {error_msg}\n\n")
-                    
+
                     # 如果是API错误，尝试等待一段时间后重试
                     if "API错误" in model_response:
                         retry_time = max(10, wait_time * 5)  # 至少等待10秒
@@ -978,27 +979,42 @@ def auto_execute_task(user_prompt, max_steps=20, screenshot_dir="data/auto_scree
                         continue
                     else:
                         break
-                
+
                 parsed_json = parse_action_output(model_response)
                 parsed_output = json.loads(parsed_json)
-                
+
                 # 打印思考过程和操作指令
                 thought = parsed_output.get('thought', '无')
                 action = parsed_output.get('action', '无')
                 print(f"操作指令: {action}")
-                
+
+                # 记录当前操作，用于检测重复操作和任务完成状态
+                current_operation = {
+                    'action': action,
+                    'start_box': parsed_output.get('start_box'),
+                    'end_box': parsed_output.get('end_box'),
+                    'content': parsed_output.get('content'),
+                    'key': parsed_output.get('key'),
+                    'direction': parsed_output.get('direction')
+                }
+
                 # 写入历史记录
                 if save_history and history_file:
                     history_file.write(f"步骤 {step_count}:\n思考: {thought}\n操作: {action}\n\n")
-                
-                # 判断是否完成任务
+
+                # 检查是否完成任务
                 if parsed_output.get("action") == "finished":
                     finish_message = f"任务完成: {parsed_output.get('content', '任务结束')}"
                     print(finish_message)
                     if save_history and history_file:
                         history_file.write(f"{finish_message}\n")
                     return f"任务成功完成，共执行 {step_count} 步"
-                
+
+                # 将当前操作添加到最近操作列表
+                recent_actions.append(current_operation)
+                if len(recent_actions) > 5:  # 只保留最近5个操作
+                    recent_actions.pop(0)
+
                 # 检查操作是否有效
                 if not parsed_output.get("action"):
                     print("警告: 模型没有返回有效的操作指令")
@@ -1006,7 +1022,19 @@ def auto_execute_task(user_prompt, max_steps=20, screenshot_dir="data/auto_scree
                         history_file.write("警告: 模型没有返回有效的操作指令\n\n")
                     # 等待一段时间后继续
                     time.sleep(wait_time)
+
+                    # 检测连续无操作的次数
+                    no_progress_count += 1
+                    if no_progress_count >= 3:  # 如果连续3次没有操作，认为任务完成
+                        warning_msg = f"连续{no_progress_count}次没有有效操作，认为任务已完成"
+                        print(warning_msg)
+                        if save_history and history_file:
+                            history_file.write(f"{warning_msg}\n")
+                        return f"任务成功完成，共执行 {step_count} 步（检测到无进展，自动结束）"
                     continue
+                else:
+                    # 如果有操作，重置无进展计数
+                    no_progress_count = 0
                 
                 # 调试模式：处理边界框
                 if debug and parsed_output.get("start_box"):
@@ -1064,6 +1092,20 @@ def auto_execute_task(user_prompt, max_steps=20, screenshot_dir="data/auto_scree
                 # 更新历史记录
                 history_text += f"Step {step_count}:\nThought: {thought}\nAction: {action}\nResult: {execution_result}\n\n"                
                 
+                # 检查是否重复执行相同操作
+                if len(recent_actions) >= 3:
+                    # 检查最近3个操作是否相同（除了步骤计数外）
+                    last_three = recent_actions[-3:]
+                    if (last_three[0]['action'] == last_three[1]['action'] == last_three[2]['action'] and
+                        last_three[0]['start_box'] == last_three[1]['start_box'] == last_three[2]['start_box'] and
+                        last_three[0]['content'] == last_three[1]['content'] == last_three[2]['content']):
+                        # 如果连续3次执行相同操作，认为任务已完成或无法继续
+                        repeated_msg = f"检测到连续3次重复操作，认为任务已完成或无法继续"
+                        print(repeated_msg)
+                        if save_history and history_file:
+                            history_file.write(f"{repeated_msg}\n")
+                        return f"任务成功完成，共执行 {step_count} 步（检测到重复操作，自动结束）"
+
                 # 根据操作类型动态调整等待时间，提高执行效率
                 if action in ["click", "left_double", "right_single"]:
                     # 简单点击操作可以使用更短的等待时间
@@ -1077,7 +1119,7 @@ def auto_execute_task(user_prompt, max_steps=20, screenshot_dir="data/auto_scree
                 else:
                     # 默认等待时间
                     time.sleep(wait_time * 0.8)
-                
+
                 # 检查是否按下ESC键中断流程
                 if is_interrupted[0]:
                     interrupted_msg = f"用户按下ESC键中断任务，在执行完步骤 {step_count} 后停止"
@@ -1108,8 +1150,16 @@ def auto_execute_task(user_prompt, max_steps=20, screenshot_dir="data/auto_scree
         if is_interrupted[0]:
             max_steps_msg = f"任务中断，共执行 {step_count} 步"
         else:
-            max_steps_msg = f"达到最大步骤数 {max_steps}，任务未完成"
-        
+            # 检查最后几步是否都没有有效操作，以判断是否实际上已完成任务
+            if no_progress_count >= 2:  # 如果最后几步都没有进展
+                max_steps_msg = f"达到最大步骤数 {max_steps}，但检测到连续无进展，可能任务已完成"
+                print("检测到连续无进展，认为任务可能已完成")
+                if save_history and history_file:
+                    history_file.write("检测到连续无进展，认为任务可能已完成\n")
+                return f"任务成功完成，共执行 {step_count} 步（检测到无进展，自动结束）"
+            else:
+                max_steps_msg = f"达到最大步骤数 {max_steps}，任务未完成"
+
         if save_history and history_file:
             history_file.write(f"{max_steps_msg}\n")
         return max_steps_msg
@@ -1165,7 +1215,7 @@ if __name__ == "__main__":
         
         result = auto_execute_task(
             user_prompt, 
-            max_steps=30, 
+            max_steps=50, 
             screenshot_dir=results_dir,
             debug=True,
             save_history=True,

@@ -1,4 +1,4 @@
-volcengine-python-sdk[ark]>=1.0.0
+openai>=1.0.0
 pillow>=8.0.0
 matplotlib>=3.3.0
 pyautogui>=0.9.52
